@@ -46,6 +46,8 @@ const App: React.FC = () => {
   const autoLoopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const imageCache = useRef<Record<string, string>>({});
   const settingsLoadedRef = useRef(false);
+  const forcedSpeakerQueueRef = useRef<string[]>([]);
+  const playerTurnsSinceDmRef = useRef(0);
 
   useEffect(() => {
     if (settingsLoadedRef.current) return;
@@ -171,6 +173,15 @@ const App: React.FC = () => {
             combat: { ...prev.combat, isActive: args.active, order: args.initiativeOrder || [], round: 1, turnIndex: 0 }
           }));
           break;
+        case 'address_character':
+          if (args.targetId) {
+            const directId = String(args.targetId);
+            const foundById = characters[directId] ? directId : null;
+            const foundByName = Object.values(characters).find(c => c.name.toLowerCase() === directId.toLowerCase());
+            const resolvedId = foundById || foundByName?.id;
+            if (resolvedId) forcedSpeakerQueueRef.current.push(resolvedId);
+          }
+          break;
       }
 
       // Log formatted tool call with result
@@ -190,74 +201,178 @@ const App: React.FC = () => {
     });
   }, [addMessage, characters, gameState.sharedMemories]);
 
-  const getRecentHistoryContext = useCallback((history: GameMessage[]) => {
+  const getStoryWindow = useCallback((history: GameMessage[]) => {
     return history
-      .filter(m => m.type === 'narrative' || m.type === 'dialogue')
-      .slice(-10)
+      .filter(m => m.type === 'narrative' || m.type === 'dialogue' || m.type === 'encounter')
+      .slice(-12)
       .map(m => `${m.senderName}: ${m.content}`)
       .join('\n');
   }, []);
+
+  const getPlayerStoryWindow = useCallback((history: GameMessage[]) => {
+    return history
+      .filter(m => m.type === 'narrative' || m.type === 'dialogue' || m.type === 'encounter')
+      .slice(-8)
+      .map(m => {
+        const speaker = m.senderName === 'Dungeon Master' ? 'Narration' : m.senderName;
+        return `${speaker}: ${m.content}`;
+      })
+      .join('\n');
+  }, []);
+
+  const formatMemories = (entries: MemoryEntry[], limit = 4) => {
+    if (!entries.length) return 'None yet.';
+    return entries.slice(-limit).map(m => `- ${m.content}`).join('\n');
+  };
+
+  const formatPartyInventory = (items: InventoryItem[]) => {
+    if (!items.length) return 'None.';
+    return items.map(i => `${i.name} x${i.quantity}`).join(', ');
+  };
+
+  const playerResponseRules = [
+    'Respond only in-character, first person.',
+    'No out-of-character analysis or system references.',
+    'Do not repeat or quote narration or other speakers.',
+    'Do not include speaker labels like "Dungeon Master:".',
+    'Do not narrate the world beyond your immediate senses.',
+    'Keep it concise: 2-4 sentences plus a brief intention or question.',
+    'If you want another party member to respond next, call address_character with their id exactly as shown.'
+  ].join(' ');
+
+  const enforceShortReply = (text: string, maxSentences: number, maxChars: number) => {
+    if (!text) return text;
+    const trimmed = text.replace(/\s+/g, ' ').trim();
+    if (!trimmed) return trimmed;
+    const sentences = trimmed.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [trimmed];
+    const limited = sentences.slice(0, maxSentences).join(' ').trim();
+    return limited.length > maxChars ? `${limited.slice(0, maxChars).trim()}...` : limited;
+  };
+
+  const sanitizePlayerReply = (text: string) => {
+    if (!text) return text;
+    const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+    const filtered = lines.filter(line => {
+      const lower = line.toLowerCase();
+      if (lower.startsWith('dungeon master:')) return false;
+      if (lower.startsWith('narration:')) return false;
+      if (lower.startsWith('dm:')) return false;
+      return true;
+    });
+    const unique: string[] = [];
+    filtered.forEach(line => {
+      if (!unique.includes(line)) unique.push(line);
+    });
+    return enforceShortReply(unique.join(' '), 3, 360);
+  };
+
+  const shouldRunDmTurn = (opts: { injected: boolean; forcedQueued: boolean }) => {
+    if (opts.injected) return true;
+    if (playerTurnsSinceDmRef.current >= 2) return true;
+    if (!opts.forcedQueued && playerTurnsSinceDmRef.current >= 1) return true;
+    return false;
+  };
 
   const processStructuredTurn = useCallback(async () => {
     if (!isStarted || isLoading) return;
     setIsLoading(true);
 
     let currentHistory = [...gameState.history];
-    const historyContext = getRecentHistoryContext(currentHistory);
+    const historyContext = getStoryWindow(currentHistory);
 
     // PHASE 1: PARTY INTENT
     setAutoPhase('PARTY_INTENT');
     let turnContext = "";
+    let injectedInThisTurn = false;
 
-    if (injectionQueue.length > 0) {
-      const injected = injectionQueue[0];
-      setInjectionQueue(prev => prev.slice(1));
-      addMessage({ sender: 'player', senderName: 'The Guide', content: injected, type: 'dialogue' });
-      turnContext = `The Guide intervenes: "${injected}"`;
-    } else {
+    const runPlayerTurn = async () => {
+      if (injectionQueue.length > 0) {
+        const injected = injectionQueue[0];
+        setInjectionQueue(prev => prev.slice(1));
+        addMessage({ sender: 'player', senderName: 'The Guide', content: injected, type: 'dialogue' });
+        injectedInThisTurn = true;
+        turnContext = `The Guide intervenes: "${injected}"`;
+        return;
+      }
+
       const partyKeys = Object.keys(characters);
-      const speakerId = partyKeys[Math.floor(Math.random() * partyKeys.length)];
+      const forcedSpeakerId = forcedSpeakerQueueRef.current.shift();
+      const speakerId = forcedSpeakerId && characters[forcedSpeakerId]
+        ? forcedSpeakerId
+        : partyKeys[Math.floor(Math.random() * partyKeys.length)];
       setActiveCharacterId(speakerId);
       
       const char = characters[speakerId];
       // Inject few recent memories automatically to nudge the AI
       const workingMemory = char.memories.slice(-3).map(m => m.content).join("; ");
       
+      const playerContext = [
+        `Setting: ${gameState.setting || 'Unknown'}`,
+        `Current Scene: ${gameState.currentScene}`,
+        `Story so far:\n${getPlayerStoryWindow(currentHistory) || 'No narrative yet.'}`,
+        `Shared Memories:\n${formatMemories(gameState.sharedMemories)}`,
+        `Your Memories:\n${formatMemories(char.memories)}`,
+        `Your Status: HP ${char.hp}/${char.maxHp}, MP ${char.mp}/${char.maxMp}, AC ${char.ac}, Level ${char.level}`,
+        `Party Inventory: ${formatPartyInventory(gameState.inventory)}`,
+        `Party Member IDs: ${Object.values(characters).map(c => `${c.name} = ${c.id}`).join(', ')}`
+      ].join('\n\n');
+
       const { text, functionCalls } = await getLLMResponse(
         settings,
-        `${char.systemMessage}\nWorking Memory context: ${workingMemory}\n\nRecent Chronicles:\n${historyContext}`,
-        `React to the recent chronicles. If you need to recall older facts, use query_memories. Use record_memory if something important happened.`
+        char.systemMessage,
+        `${playerContext}\n\nRules: ${playerResponseRules}\n\nRespond to the most recent events.`
       );
       if (functionCalls) handleToolCalls(functionCalls, speakerId);
-      addMessage({ sender: speakerId, senderName: char.name, content: text, type: 'dialogue' });
-      turnContext = `${char.name}: ${text}`;
+      const cleanedText = sanitizePlayerReply(text);
+      addMessage({ sender: speakerId, senderName: char.name, content: cleanedText, type: 'dialogue' });
+      turnContext = `${char.name}: ${cleanedText}`;
       setActiveCharacterId(null);
-    }
+    };
+
+    let playerTurnsThisCycle = 0;
+    do {
+      await runPlayerTurn();
+      playerTurnsThisCycle += 1;
+      playerTurnsSinceDmRef.current += 1;
+    } while (forcedSpeakerQueueRef.current.length > 0 && playerTurnsThisCycle < 2);
 
     await new Promise(r => setTimeout(r, 800));
 
-    // PHASE 2: DM RESOLUTION
-    setAutoPhase('DM_RESOLUTION');
-    const { text: dmText, functionCalls: dmCalls } = await getLLMResponse(
-      settings,
-      `${SYSTEM_PROMPTS[AgentType.DM]}\n\nChronicle Window:\n${historyContext}\n${turnContext}`,
-      `Resolve the scene. Use your long-term memory via query_memories to ensure consistency.`
-    );
-    if (dmCalls) handleToolCalls(dmCalls, AgentType.DM);
-    addMessage({ sender: AgentType.DM, senderName: 'Dungeon Master', content: dmText, type: 'narrative' });
+    if (shouldRunDmTurn({ injected: injectedInThisTurn, forcedQueued: forcedSpeakerQueueRef.current.length > 0 })) {
+      // PHASE 2: DM RESOLUTION
+      setAutoPhase('DM_RESOLUTION');
+      const dmContext = [
+        `Setting: ${gameState.setting || 'Unknown'}`,
+        `Current Scene: ${gameState.currentScene}`,
+        `Chronicle Window:\n${historyContext || 'No narrative yet.'}`,
+        `Latest Turn:\n${turnContext}`,
+        `Party Gold: ${gameState.gold}`,
+        `Party Inventory: ${formatPartyInventory(gameState.inventory)}`
+      ].join('\n\n');
 
-    // PHASE 3: META COMMENT
-    setAutoPhase('META_COMMENT');
-    const { text: metaText } = await getLLMResponse(
-      settings,
-      SYSTEM_PROMPTS[AgentType.META],
-      `Sharp observation for the Overseer tab on: "${dmText.substring(0, 100)}..."`
-    );
-    addMessage({ sender: AgentType.META, senderName: 'Overseer', content: metaText, type: 'meta' });
+      const { text: dmText, functionCalls: dmCalls } = await getLLMResponse(
+        settings,
+        SYSTEM_PROMPTS[AgentType.DM],
+        `${dmContext}\n\nResolve the scene with vivid narration.`
+      );
+      if (dmCalls) handleToolCalls(dmCalls, AgentType.DM);
+      const trimmedDmText = enforceShortReply(dmText, 4, 520);
+      addMessage({ sender: AgentType.DM, senderName: 'Dungeon Master', content: trimmedDmText, type: 'narrative' });
+      playerTurnsSinceDmRef.current = 0;
+
+      // PHASE 3: META COMMENT
+      setAutoPhase('META_COMMENT');
+      const { text: metaText } = await getLLMResponse(
+        settings,
+        SYSTEM_PROMPTS[AgentType.META],
+        `Sharp observation for the Overseer tab on: "${dmText.substring(0, 120)}..."`
+      );
+      addMessage({ sender: AgentType.META, senderName: 'Overseer', content: enforceShortReply(metaText, 2, 240), type: 'meta' });
+    }
 
     setAutoPhase('IDLE');
     setIsLoading(false);
-  }, [isStarted, isLoading, injectionQueue, characters, gameState, handleToolCalls, addMessage, getRecentHistoryContext, settings]);
+  }, [isStarted, isLoading, injectionQueue, characters, gameState, handleToolCalls, addMessage, getStoryWindow, getPlayerStoryWindow, settings]);
 
   const handleStartGame = async (setting: string) => {
     setIsStarted(true);
@@ -371,7 +486,13 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen w-full flex flex-col bg-[#050505] text-neutral-200 overflow-hidden">
-      {!isStarted && <Onboarding onStart={handleStartGame} />}
+      {!isStarted && (
+        <Onboarding
+          characters={characters}
+          onUpdateCharacters={setCharacters}
+          onStart={handleStartGame}
+        />
+      )}
 
       <header className="h-16 flex-shrink-0 flex items-center justify-between px-6 border-b border-neutral-800 bg-black/90 backdrop-blur-lg z-50">
         <div className="flex items-center gap-4">
@@ -395,7 +516,7 @@ const App: React.FC = () => {
           <button 
             onClick={async () => {
               setIsLoading(true);
-              const summary = await summarizeChronicle(settings, getRecentHistoryContext(gameState.history));
+              const summary = await summarizeChronicle(settings, getStoryWindow(gameState.history));
               setSummaryText(summary);
               setShowSummary(true);
               setIsLoading(false);

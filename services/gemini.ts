@@ -105,6 +105,18 @@ const dndToolDefinitions: FunctionDeclaration[] = [
       },
       required: ['active']
     }
+  },
+  {
+    name: 'address_character',
+    description: 'Prompt a specific party member to respond next.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        targetId: { type: Type.STRING, description: 'Character ID to respond next.' },
+        message: { type: Type.STRING, description: 'Short in-character prompt or question.' }
+      },
+      required: ['targetId']
+    }
   }
 ];
 

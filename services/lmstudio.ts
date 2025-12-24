@@ -142,6 +142,21 @@ const toolDefinitions: OpenAiTool[] = [
         required: ['active']
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'address_character',
+      description: 'Prompt a specific party member to respond next.',
+      parameters: {
+        type: 'object',
+        properties: {
+          targetId: { type: 'string', description: 'Character ID to respond next.' },
+          message: { type: 'string', description: 'Short in-character prompt or question.' }
+        },
+        required: ['targetId']
+      }
+    }
   }
 ];
 
@@ -175,8 +190,36 @@ const extractInlineToolCalls = (content: string) => {
   return calls;
 };
 
+const extractFunctionCallBlocks = (content: string) => {
+  const calls: ToolCall[] = [];
+  const blockRegex = /<(function-call|tool_call)>\s*([\s\S]*?)\s*<\/(function-call|tool_call)>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = blockRegex.exec(content)) !== null) {
+    const raw = match[2].trim();
+    try {
+      const parsed = JSON.parse(raw);
+      const name = parsed.name;
+      if (!name || !toolNames.has(name)) continue;
+      const argsRaw = parsed.arguments;
+      const args = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : (argsRaw || {});
+      calls.push({ name, args });
+    } catch {
+      continue;
+    }
+  }
+
+  return calls;
+};
+
 const stripInlineToolBlocks = (content: string) =>
-  content.replace(/<([a-z_]+)>\s*[\s\S]*?\s*<\/\1>/gi, '').trim();
+  content
+    .replace(/<(function-call|tool_call)>\s*[\s\S]*?\s*<\/(function-call|tool_call)>/gi, '')
+    .replace(/<([a-z_]+)>\s*[\s\S]*?\s*<\/\1>/gi, '')
+    .trim();
+
+const stripThinkBlocks = (content: string) =>
+  content.replace(/<think>\s*[\s\S]*?\s*<\/think>/gi, '').trim();
 
 const normalizeBaseUrl = (baseUrl: string) => baseUrl.replace(/\/+$/, '');
 
@@ -208,8 +251,11 @@ export const getLmStudioResponse = async (
     const data = await response.json();
     const message = data.choices?.[0]?.message || {};
     const rawContent = message.content || '';
-    const inlineCalls = extractInlineToolCalls(rawContent);
-    const visibleText = stripInlineToolBlocks(extractResponseText(rawContent));
+    const inlineCalls = [
+      ...extractInlineToolCalls(rawContent),
+      ...extractFunctionCallBlocks(rawContent)
+    ];
+    const visibleText = stripThinkBlocks(stripInlineToolBlocks(extractResponseText(rawContent)));
 
     const toolCalls = (message.tool_calls || []).map((call: any) => ({
       name: call.function?.name,
