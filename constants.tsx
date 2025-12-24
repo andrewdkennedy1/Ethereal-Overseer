@@ -118,3 +118,10 @@ export const SETTING_SUGGESTIONS = [
   "The Frozen Tundra of the Frost Giants",
   "The Eldritch Library of Floating Isles"
 ];
+
+export const DEFAULT_SETTINGS = {
+  llmProvider: 'gemini',
+  llmModel: 'gemini-3-flash-preview',
+  lmStudioBaseUrl: 'http://localhost:1234/v1',
+  enableImageGeneration: true
+} as const;

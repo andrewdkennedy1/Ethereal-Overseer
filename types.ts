@@ -79,6 +79,15 @@ export interface GameState {
   combat: CombatState;
 }
 
+export type LlmProvider = 'gemini' | 'lmstudio';
+
+export interface AppSettings {
+  llmProvider: LlmProvider;
+  llmModel: string;
+  lmStudioBaseUrl: string;
+  enableImageGeneration: boolean;
+}
+
 export enum AgentType {
   DM = 'DungeonMaster',
   META = 'MetaGameManager',

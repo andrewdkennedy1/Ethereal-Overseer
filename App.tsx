@@ -1,14 +1,16 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { AgentType, Character, GameMessage, GameState, InventoryItem, WorldImpact, MemoryEntry } from './types';
-import { INITIAL_CHARACTERS, SYSTEM_PROMPTS } from './constants';
-import { getGeminiResponse, generateImage, summarizeStory } from './services/gemini';
+import { AgentType, AppSettings, Character, GameMessage, GameState, InventoryItem, WorldImpact, MemoryEntry } from './types';
+import { DEFAULT_SETTINGS, INITIAL_CHARACTERS, SYSTEM_PROMPTS } from './constants';
+import { generateImage, getLLMResponse, summarizeChronicle } from './services/llm';
 import CharacterCard from './components/CharacterCard';
 import GameChat from './components/GameChat';
 import Onboarding from './components/Onboarding';
+import SettingsPanel from './components/SettingsPanel';
 
 type AutoPhase = 'IDLE' | 'PARTY_INTENT' | 'DM_RESOLUTION' | 'META_COMMENT';
 type SideTab = 'LOG' | 'OVERSEER';
+const SETTINGS_STORAGE_KEY = 'eo-settings';
 
 const App: React.FC = () => {
   const [gameState, setGameState] = useState<GameState>({
@@ -34,6 +36,8 @@ const App: React.FC = () => {
   const [activeCharacterId, setActiveCharacterId] = useState<string | null>(null);
   const [editingCharacter, setEditingCharacter] = useState<Character | null>(null);
   const [activeTab, setActiveTab] = useState<SideTab>('LOG');
+  const [settings, setSettings] = useState<AppSettings>({ ...DEFAULT_SETTINGS });
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   
   const [isAutoMode, setIsAutoMode] = useState(false);
   const [autoPhase, setAutoPhase] = useState<AutoPhase>('IDLE');
@@ -41,6 +45,27 @@ const App: React.FC = () => {
   
   const autoLoopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const imageCache = useRef<Record<string, string>>({});
+  const settingsLoadedRef = useRef(false);
+
+  useEffect(() => {
+    if (settingsLoadedRef.current) return;
+    settingsLoadedRef.current = true;
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      setSettings(prev => ({
+        ...prev,
+        ...parsed
+      }));
+    } catch {
+      console.warn('Failed to parse saved settings');
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [settings]);
 
   const addMessage = useCallback((msg: Partial<GameMessage>) => {
     const newMsg: GameMessage = {
@@ -198,8 +223,8 @@ const App: React.FC = () => {
       // Inject few recent memories automatically to nudge the AI
       const workingMemory = char.memories.slice(-3).map(m => m.content).join("; ");
       
-      const { text, functionCalls } = await getGeminiResponse(
-        'gemini-3-flash-preview',
+      const { text, functionCalls } = await getLLMResponse(
+        settings,
         `${char.systemMessage}\nWorking Memory context: ${workingMemory}\n\nRecent Chronicles:\n${historyContext}`,
         `React to the recent chronicles. If you need to recall older facts, use query_memories. Use record_memory if something important happened.`
       );
@@ -213,8 +238,8 @@ const App: React.FC = () => {
 
     // PHASE 2: DM RESOLUTION
     setAutoPhase('DM_RESOLUTION');
-    const { text: dmText, functionCalls: dmCalls } = await getGeminiResponse(
-      'gemini-3-flash-preview',
+    const { text: dmText, functionCalls: dmCalls } = await getLLMResponse(
+      settings,
       `${SYSTEM_PROMPTS[AgentType.DM]}\n\nChronicle Window:\n${historyContext}\n${turnContext}`,
       `Resolve the scene. Use your long-term memory via query_memories to ensure consistency.`
     );
@@ -223,8 +248,8 @@ const App: React.FC = () => {
 
     // PHASE 3: META COMMENT
     setAutoPhase('META_COMMENT');
-    const { text: metaText } = await getGeminiResponse(
-      'gemini-3-flash-preview',
+    const { text: metaText } = await getLLMResponse(
+      settings,
       SYSTEM_PROMPTS[AgentType.META],
       `Sharp observation for the Overseer tab on: "${dmText.substring(0, 100)}..."`
     );
@@ -232,7 +257,7 @@ const App: React.FC = () => {
 
     setAutoPhase('IDLE');
     setIsLoading(false);
-  }, [isStarted, isLoading, injectionQueue, characters, gameState, handleToolCalls, addMessage, getRecentHistoryContext]);
+  }, [isStarted, isLoading, injectionQueue, characters, gameState, handleToolCalls, addMessage, getRecentHistoryContext, settings]);
 
   const handleStartGame = async (setting: string) => {
     setIsStarted(true);
@@ -242,23 +267,25 @@ const App: React.FC = () => {
     const updatedChars = { ...characters };
     const charIds = Object.keys(updatedChars);
     
-    const imagePromises = charIds.map(async (id) => {
-      const desc = updatedChars[id].visualDescription;
-      if (imageCache.current[desc]) {
-        return { id, img: imageCache.current[desc] };
-      } else {
-        const img = await generateImage(desc);
-        if (img) imageCache.current[desc] = img;
-        return { id, img };
-      }
-    });
+    if (settings.enableImageGeneration) {
+      const imagePromises = charIds.map(async (id) => {
+        const desc = updatedChars[id].visualDescription;
+        if (imageCache.current[desc]) {
+          return { id, img: imageCache.current[desc] };
+        } else {
+          const img = await generateImage(settings, desc);
+          if (img) imageCache.current[desc] = img;
+          return { id, img };
+        }
+      });
 
-    imagePromises.forEach(p => p.then(({ id, img }) => {
-      if (img) setCharacters(prev => ({ ...prev, [id]: { ...prev[id], image: img } }));
-    }));
+      imagePromises.forEach(p => p.then(({ id, img }) => {
+        if (img) setCharacters(prev => ({ ...prev, [id]: { ...prev[id], image: img } }));
+      }));
+    }
 
-    const { text, functionCalls } = await getGeminiResponse(
-      'gemini-3-flash-preview',
+    const { text, functionCalls } = await getLLMResponse(
+      settings,
       SYSTEM_PROMPTS[AgentType.DM],
       `Introduction to: ${setting}. Be atmospheric.`
     );
@@ -368,7 +395,7 @@ const App: React.FC = () => {
           <button 
             onClick={async () => {
               setIsLoading(true);
-              const summary = await summarizeStory(getRecentHistoryContext(gameState.history));
+              const summary = await summarizeChronicle(settings, getRecentHistoryContext(gameState.history));
               setSummaryText(summary);
               setShowSummary(true);
               setIsLoading(false);
@@ -376,6 +403,12 @@ const App: React.FC = () => {
             className="px-3 py-1 text-[10px] cinzel bg-neutral-900 border border-neutral-800 rounded hover:bg-neutral-800"
           >
             📜 Archive
+          </button>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="px-3 py-1 text-[10px] cinzel bg-neutral-900 border border-neutral-800 rounded hover:bg-neutral-800"
+          >
+            ⚙️ Settings
           </button>
         </div>
       </header>
@@ -511,6 +544,14 @@ const App: React.FC = () => {
             <div className="text-lg leading-loose whitespace-pre-wrap font-serif text-black/90 italic drop-shadow-sm">{summaryText}</div>
           </div>
         </div>
+      )}
+
+      {isSettingsOpen && (
+        <SettingsPanel
+          settings={settings}
+          onChange={setSettings}
+          onClose={() => setIsSettingsOpen(false)}
+        />
       )}
       
       <style>{`
