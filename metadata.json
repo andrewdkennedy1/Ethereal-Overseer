@@ -1,0 +1,8 @@
+{
+  "name": "Ethereal Overseer: D&D AI Adventures",
+  "description": "A high-fidelity, multi-agent D&D experience where an AI Dungeon Master weaves epic narratives, manages party members, and reacts to your every command using the Gemini API.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
